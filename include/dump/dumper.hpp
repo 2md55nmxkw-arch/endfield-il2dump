@@ -16,6 +16,9 @@ public:
 
     void DumpAll( const std::string & outputDir );
 
+    static void WriteIdaPythonScript( const std::string & path, const std::string & scriptJsonPath );
+    static void WriteIdaIdcScript( const std::string & path, const std::string & scriptJsonPath );
+
 private:
     const Metadata & md_;
     const Il2CppBinary & bin_;
@@ -35,6 +38,7 @@ private:
 
     void WriteScriptJson( const std::string & path );
     void WriteStringLiteralJson( const std::string & path );
+    void WritePerTypeTree( const std::string & rootDir );
     std::string BuildMethodSignature( const MethodDef & m, const std::string & typeFq );
     std::string BuildGenericInstanceSignature( const MethodDef & m, const TypeDef & td,
                                                const Il2CppBinary::GenericInstance & inst );

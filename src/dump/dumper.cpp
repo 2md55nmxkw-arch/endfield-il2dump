@@ -2,6 +2,7 @@
 #include <dump/utils.hpp>
 
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <unordered_set>
@@ -203,6 +204,81 @@ std::string EscapeJson( const std::string & s ) {
     return r;
 }
 
+bool IsReservedWindowsName( const std::string & s ) {
+    static const char * names [ ] = {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+        "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"
+    };
+    std::string up;
+    up.reserve( s.size( ) );
+    for ( char c : s ) up += ( char ) std::toupper( ( unsigned char ) c );
+    for ( const char * n : names )
+        if ( up == n ) return true;
+    return false;
+}
+
+std::string SanitizePathPart( const std::string & s ) {
+    std::string r;
+    r.reserve( s.size( ) );
+    for ( unsigned char c : s ) {
+        if ( c < 0x20 || c == '<' || c == '>' || c == ':' || c == '"' ||
+             c == '/' || c == '\\' || c == '|' || c == '?' || c == '*' )
+            r += '_';
+        else
+            r += ( char ) c;
+    }
+    while ( !r.empty( ) && ( r.back( ) == ' ' || r.back( ) == '.' ) )
+        r.pop_back( );
+    if ( r.empty( ) )
+        r = "_";
+    if ( IsReservedWindowsName( r ) )
+        r += "_";
+    if ( r.size( ) > 120 )
+        r.resize( 120 );
+    return r;
+}
+
+std::string SanitizeFileBase( const std::string & name ) {
+    std::string s = name;
+    auto pos = s.find( '`' );
+    if ( pos != std::string::npos ) {
+        s.erase( 0, 0 );
+        std::string clean;
+        clean.reserve( s.size( ) );
+        for ( char c : s ) {
+            if ( c == '`' ) { clean += '_'; continue; }
+            clean += c;
+        }
+        s = std::move( clean );
+    }
+    return SanitizePathPart( s );
+}
+
+std::vector<std::string> SplitNamespace( const std::string & ns ) {
+    std::vector<std::string> out;
+    std::string cur;
+    for ( char c : ns ) {
+        if ( c == '.' ) {
+            if ( !cur.empty( ) ) { out.push_back( cur ); cur.clear( ); }
+        }
+        else cur += c;
+    }
+    if ( !cur.empty( ) ) out.push_back( cur );
+    return out;
+}
+
+std::string AssemblyDirName( const std::string & imageName ) {
+    std::string s = imageName;
+    if ( s.size( ) >= 4 ) {
+        std::string tail = s.substr( s.size( ) - 4 );
+        for ( char & c : tail ) c = ( char ) std::tolower( ( unsigned char ) c );
+        if ( tail == ".dll" || tail == ".exe" )
+            s.resize( s.size( ) - 4 );
+    }
+    return SanitizePathPart( s );
+}
+
 }
 
 void Dumper::DumpAll( const std::string & outputDir ) {
@@ -211,6 +287,9 @@ void Dumper::DumpAll( const std::string & outputDir ) {
     std::string dumpPath   = outputDir + "\\dump.cs";
     std::string scriptPath = outputDir + "\\script.json";
     std::string stringPath = outputDir + "\\stringliteral.json";
+    std::string typesDir   = outputDir + "\\types";
+    std::string idaPyPath  = outputDir + "\\ida_rename.py";
+    std::string idaIdcPath = outputDir + "\\ida_rename.idc";
 
     std::ofstream out( dumpPath, std::ios::out | std::ios::trunc );
     if ( !out.is_open( ) ) {
@@ -232,11 +311,17 @@ void Dumper::DumpAll( const std::string & outputDir ) {
 
     WriteScriptJson( scriptPath );
     WriteStringLiteralJson( stringPath );
+    WritePerTypeTree( typesDir );
+    WriteIdaPythonScript( idaPyPath, "script.json" );
+    WriteIdaIdcScript( idaIdcPath, "script.json" );
 
     Log( "" );
     Log( "dump.cs            -> " + dumpPath );
     Log( "script.json        -> " + scriptPath );
     Log( "stringliteral.json -> " + stringPath );
+    Log( "types/             -> " + typesDir );
+    Log( "ida_rename.py      -> " + idaPyPath );
+    Log( "ida_rename.idc     -> " + idaIdcPath );
     Log( "RVA resolved: " + std::to_string( g_rvaResolved ) + " / " +
          std::to_string( g_rvaTotal ) );
 }
@@ -734,4 +819,210 @@ void Dumper::WriteStringLiteralJson( const std::string & path ) {
         out << "\n";
     }
     out << "]\n";
+}
+
+void Dumper::WritePerTypeTree( const std::string & rootDir ) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories( fs::u8path( rootDir ), ec );
+
+    std::unordered_map<std::string, std::unordered_map<std::string, int>> usedNames;
+
+    for ( const auto & img : md_.Images( ) ) {
+        std::string asmName = md_.GetString( img.nameIndex );
+        std::string asmDir = AssemblyDirName( asmName );
+
+        int typeEnd = img.typeStart + ( int ) img.typeCount;
+        for ( int ti = img.typeStart; ti < typeEnd; ++ti ) {
+            const TypeDef & td = md_.Types( ) [ ti ];
+            if ( td.declaringTypeIndex != -1 )
+                continue;
+
+            std::string ns = md_.GetString( td.namespaceIndex );
+            std::vector<std::string> nsParts = SplitNamespace( ns );
+
+            fs::path dir = fs::u8path( rootDir ) / fs::u8path( asmDir );
+            for ( const auto & p : nsParts )
+                dir /= fs::u8path( SanitizePathPart( p ) );
+            fs::create_directories( dir, ec );
+
+            std::string base = SanitizeFileBase( md_.GetString( td.nameIndex ) );
+            std::string key = dir.u8string( );
+            int & cnt = usedNames[ key ][ base ];
+            std::string fileName = base;
+            if ( cnt > 0 ) {
+                char suf[ 16 ];
+                std::snprintf( suf, sizeof( suf ), "_%d", cnt );
+                fileName += suf;
+            }
+            ++cnt;
+            fileName += ".cs";
+
+            fs::path filePath = dir / fs::u8path( fileName );
+            std::ofstream f( filePath.u8string( ), std::ios::out | std::ios::trunc );
+            if ( !f.is_open( ) )
+                continue;
+
+            f << "// Assembly: " << asmName << "\n";
+            f << "// TypeDefIndex: " << ti << "\n";
+            if ( !ns.empty( ) ) {
+                f << "namespace " << ns << "\n{\n";
+                EmitType( f, asmName, ti, 1 );
+                f << "}\n";
+            }
+            else {
+                EmitType( f, asmName, ti, 0 );
+            }
+        }
+    }
+}
+
+void Dumper::WriteIdaPythonScript( const std::string & path, const std::string & scriptJsonPath ) {
+    std::ofstream out( path, std::ios::out | std::ios::trunc );
+    if ( !out.is_open( ) ) {
+        Log( "error: cannot open " + path );
+        return;
+    }
+    out << "import idaapi\n";
+    out << "import idc\n";
+    out << "import ida_name\n";
+    out << "import ida_funcs\n";
+    out << "import ida_kernwin\n";
+    out << "import ida_idaapi\n";
+    out << "import json\n";
+    out << "import os\n";
+    out << "import re\n";
+    out << "\n";
+    out << "DEFAULT_JSON = " << "\"" << scriptJsonPath << "\"" << "\n";
+    out << "\n";
+    out << "_safe = re.compile(r\"[^A-Za-z0-9_]\")\n";
+    out << "\n";
+    out << "def sanitize(name):\n";
+    out << "    name = name.replace(\"::\", \"_\")\n";
+    out << "    name = _safe.sub(\"_\", name)\n";
+    out << "    if not name:\n";
+    out << "        name = \"sub\"\n";
+    out << "    if name[0].isdigit():\n";
+    out << "        name = \"_\" + name\n";
+    out << "    if len(name) > 511:\n";
+    out << "        name = name[:511]\n";
+    out << "    return name\n";
+    out << "\n";
+    out << "def pick_path():\n";
+    out << "    here = os.path.dirname(idaapi.get_input_file_path() or \"\")\n";
+    out << "    cand = os.path.join(here, DEFAULT_JSON)\n";
+    out << "    if os.path.isfile(cand):\n";
+    out << "        return cand\n";
+    out << "    return ida_kernwin.ask_file(False, \"script.json\", \"Select script.json\")\n";
+    out << "\n";
+    out << "def main():\n";
+    out << "    p = pick_path()\n";
+    out << "    if not p:\n";
+    out << "        return\n";
+    out << "    with open(p, \"r\", encoding=\"utf-8\") as f:\n";
+    out << "        data = json.load(f)\n";
+    out << "    base = idaapi.get_imagebase()\n";
+    out << "    methods = data.get(\"ScriptMethod\", []) or []\n";
+    out << "    ok = 0\n";
+    out << "    fail = 0\n";
+    out << "    used = {}\n";
+    out << "    flags = ida_name.SN_NOWARN | ida_name.SN_NOCHECK | ida_name.SN_FORCE\n";
+    out << "    for i, m in enumerate(methods):\n";
+    out << "        addr = m.get(\"Address\")\n";
+    out << "        sig = m.get(\"Name\", \"\")\n";
+    out << "        if not addr or not sig:\n";
+    out << "            continue\n";
+    out << "        ea = base + (addr & 0xFFFFFFFF) if addr < base else addr\n";
+    out << "        if ea == ida_idaapi.BADADDR:\n";
+    out << "            continue\n";
+    out << "        f = ida_funcs.get_func(ea)\n";
+    out << "        if not f:\n";
+    out << "            ida_funcs.add_func(ea)\n";
+    out << "            f = ida_funcs.get_func(ea)\n";
+    out << "        target = f.start_ea if f else ea\n";
+    out << "        nm = sanitize(sig)\n";
+    out << "        n = used.get(nm, 0)\n";
+    out << "        used[nm] = n + 1\n";
+    out << "        final = nm if n == 0 else \"%s_%d\" % (nm, n)\n";
+    out << "        if ida_name.set_name(target, final, flags):\n";
+    out << "            idc.set_cmt(target, sig, 0)\n";
+    out << "            ok += 1\n";
+    out << "        else:\n";
+    out << "            fail += 1\n";
+    out << "        if (i + 1) % 5000 == 0:\n";
+    out << "            print(\"[il2dump] processed %d / %d\" % (i + 1, len(methods)))\n";
+    out << "    print(\"[il2dump] done. renamed=%d failed=%d total=%d\" % (ok, fail, len(methods)))\n";
+    out << "\n";
+    out << "main()\n";
+}
+
+void Dumper::WriteIdaIdcScript( const std::string & path, const std::string & scriptJsonPath ) {
+    std::ofstream out( path, std::ios::out | std::ios::trunc );
+    if ( !out.is_open( ) ) {
+        Log( "error: cannot open " + path );
+        return;
+    }
+    out << "#include <idc.idc>\n";
+    out << "\n";
+    out << "static sanitize(s) {\n";
+    out << "    auto i, c, r;\n";
+    out << "    r = \"\";\n";
+    out << "    for ( i = 0; i < strlen(s); i = i + 1 ) {\n";
+    out << "        c = substr(s, i, i + 1);\n";
+    out << "        if ( (c >= \"A\" && c <= \"Z\") || (c >= \"a\" && c <= \"z\") ||\n";
+    out << "             (c >= \"0\" && c <= \"9\") || c == \"_\" )\n";
+    out << "            r = r + c;\n";
+    out << "        else\n";
+    out << "            r = r + \"_\";\n";
+    out << "    }\n";
+    out << "    if ( strlen(r) == 0 ) r = \"sub\";\n";
+    out << "    if ( strlen(r) > 480 ) r = substr(r, 0, 480);\n";
+    out << "    return r;\n";
+    out << "}\n";
+    out << "\n";
+    out << "static main() {\n";
+    out << "    auto path, fp, line, all, n, ok, fail, base;\n";
+    out << "    auto addrPos, namePos, addrEnd, nameEnd, addrStr, nameStr, addr, ea, nm;\n";
+    out << "    path = ask_file(0, \"" << scriptJsonPath << "\", \"Select script.json\");\n";
+    out << "    if ( path == \"\" ) return;\n";
+    out << "    fp = fopen(path, \"r\");\n";
+    out << "    if ( fp == 0 ) { msg(\"cannot open script.json\\n\"); return; }\n";
+    out << "    all = \"\";\n";
+    out << "    while ( (line = readstr(fp)) != -1 )\n";
+    out << "        all = all + line;\n";
+    out << "    fclose(fp);\n";
+    out << "    base = get_imagebase();\n";
+    out << "    n = 0; ok = 0; fail = 0;\n";
+    out << "    addrPos = 0;\n";
+    out << "    while ( 1 ) {\n";
+    out << "        addrPos = strstr(all, \"\\\"Address\\\":\", addrPos);\n";
+    out << "        if ( addrPos < 0 ) break;\n";
+    out << "        addrPos = addrPos + 10;\n";
+    out << "        addrEnd = strstr(all, \",\", addrPos);\n";
+    out << "        if ( addrEnd < 0 ) break;\n";
+    out << "        addrStr = substr(all, addrPos, addrEnd);\n";
+    out << "        namePos = strstr(all, \"\\\"Name\\\":\", addrEnd);\n";
+    out << "        if ( namePos < 0 ) break;\n";
+    out << "        namePos = strstr(all, \"\\\"\", namePos + 7) + 1;\n";
+    out << "        nameEnd = strstr(all, \"\\\"\", namePos);\n";
+    out << "        while ( nameEnd > 0 && substr(all, nameEnd - 1, nameEnd) == \"\\\\\" )\n";
+    out << "            nameEnd = strstr(all, \"\\\"\", nameEnd + 1);\n";
+    out << "        if ( nameEnd < 0 ) break;\n";
+    out << "        nameStr = substr(all, namePos, nameEnd);\n";
+    out << "        addrPos = nameEnd;\n";
+    out << "        addr = atol(addrStr);\n";
+    out << "        if ( addr == 0 ) continue;\n";
+    out << "        ea = addr;\n";
+    out << "        if ( addr < base ) ea = base + addr;\n";
+    out << "        nm = sanitize(nameStr);\n";
+    out << "        if ( set_name(ea, nm, SN_NOWARN | SN_NOCHECK) ) {\n";
+    out << "            set_cmt(ea, nameStr, 0);\n";
+    out << "            ok = ok + 1;\n";
+    out << "        }\n";
+    out << "        else fail = fail + 1;\n";
+    out << "        n = n + 1;\n";
+    out << "        if ( (n % 5000) == 0 ) msg(\"[il2dump] %d processed\\n\", n);\n";
+    out << "    }\n";
+    out << "    msg(\"[il2dump] done. renamed=%d failed=%d total=%d\\n\", ok, fail, n);\n";
+    out << "}\n";
 }
